@@ -331,6 +331,7 @@ const DerivedConfig = struct {
     title_report: bool,
     links: []DerivedConfig.Link,
     link_previews: configpkg.LinkPreviews,
+    link_file_command: ?[]const u8,
     scroll_to_bottom: configpkg.Config.ScrollToBottom,
     notify_on_command_finish: configpkg.Config.NotifyOnCommandFinish,
     notify_on_command_finish_action: configpkg.Config.NotifyOnCommandFinishAction,
@@ -409,6 +410,10 @@ const DerivedConfig = struct {
             .title_report = config.@"title-report",
             .links = links,
             .link_previews = config.@"link-previews",
+            .link_file_command = if (config.@"link-file-command") |command|
+                try alloc.dupe(u8, command)
+            else
+                null,
             .scroll_to_bottom = config.@"scroll-to-bottom",
             .notify_on_command_finish = config.@"notify-on-command-finish",
             .notify_on_command_finish_action = config.@"notify-on-command-finish-action",
@@ -2061,6 +2066,281 @@ fn resolvePathForOpening(
     }
 
     return null;
+}
+
+const FileLinkEncoding = enum { plain, percent_encoded };
+
+/// Open an existing file link with the configured command.
+fn openFileWithCommand(
+    self: *Surface,
+    value: []const u8,
+    encoding: FileLinkEncoding,
+) !bool {
+    const command = self.config.link_file_command orelse return false;
+
+    var arena = ArenaAllocator.init(self.alloc);
+    var arena_owned = true;
+    defer if (arena_owned) arena.deinit();
+    const alloc = arena.allocator();
+
+    const argv = try linkFileCommandArgs(
+        alloc,
+        command,
+        value,
+        encoding,
+        if (encoding == .percent_encoded) self.io.terminal.getPwd() else null,
+    ) orelse return false;
+
+    // why: process creation can stall while the renderer mutex is held.
+    const thread = std.Thread.spawn(.{}, runLinkFileCommand, .{
+        self.alloc,
+        arena,
+        argv,
+    }) catch |err| {
+        log.warn("link-file-command failed to spawn thread err={}", .{err});
+        return false;
+    };
+    thread.detach();
+    arena_owned = false;
+    return true;
+}
+
+fn linkFileCommandArgs(
+    alloc: Allocator,
+    command: []const u8,
+    value: []const u8,
+    encoding: FileLinkEncoding,
+    terminal_pwd: ?[]const u8,
+) !?[][]const u8 {
+    if (!std.fs.path.isAbsolute(command)) return null;
+    const command_stat = std.fs.cwd().statFile(command) catch return null;
+    if (command_stat.kind != .file) return null;
+    std.posix.access(command, std.posix.X_OK) catch return null;
+
+    const normalized = switch (encoding) {
+        .plain => value,
+        .percent_encoded => decoded: {
+            // why: decoding plain text would change literal `%XX` filenames.
+            const buffer = try alloc.dupe(u8, value);
+            break :decoded std.Uri.percentDecodeInPlace(buffer);
+        },
+    };
+
+    const parsed = input.Link.parseFilePath(normalized);
+    if (parsed.path.len == 0) return null;
+    const path = if (std.fs.path.isAbsolute(parsed.path))
+        parsed.path
+    else relative: {
+        const terminal_dir = terminal_pwd orelse return null;
+        if (!std.fs.path.isAbsolute(terminal_dir)) return null;
+        break :relative try std.fs.path.resolve(alloc, &.{ terminal_dir, parsed.path });
+    };
+    const path_stat = std.fs.cwd().statFile(path) catch return null;
+    if (path_stat.kind != .file) return null;
+
+    const argv = try alloc.alloc([]const u8, 4);
+    argv[0] = try alloc.dupe(u8, command);
+    argv[1] = try alloc.dupe(u8, path);
+    argv[2] = try alloc.dupe(u8, parsed.line orelse "1");
+    argv[3] = try alloc.dupe(u8, parsed.column orelse "1");
+    return argv;
+}
+
+fn runLinkFileCommand(
+    alloc: Allocator,
+    arena_: ArenaAllocator,
+    argv: []const []const u8,
+) void {
+    var arena = arena_;
+    defer arena.deinit();
+
+    var child: std.process.Child = .init(argv, alloc);
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    child.spawn() catch |err| {
+        log.warn("link-file-command failed to spawn err={}", .{err});
+        return;
+    };
+    _ = child.wait() catch {};
+}
+
+test "link file command args and fallback" {
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const root = try tmp_dir.dir.realpathAlloc(alloc, ".");
+
+    {
+        var file = try tmp_dir.dir.createFile("command", .{});
+        defer file.close();
+        try file.chmod(0o700);
+    }
+    {
+        var file = try tmp_dir.dir.createFile("not-executable", .{});
+        defer file.close();
+        try file.chmod(0o600);
+    }
+    const source_names = [_][]const u8{
+        "source:with:colon.zig",
+        "source with space%sign.zig",
+        "literal%20name.zig",
+    };
+    for (source_names) |name| {
+        var file = try tmp_dir.dir.createFile(name, .{});
+        file.close();
+    }
+
+    const command = try std.fs.path.join(alloc, &.{ root, "command" });
+    const not_executable = try std.fs.path.join(alloc, &.{ root, "not-executable" });
+    const source = try std.fs.path.join(alloc, &.{ root, "source:with:colon.zig" });
+    const source_with_escapes = try std.fs.path.join(
+        alloc,
+        &.{ root, "source with space%sign.zig" },
+    );
+    const literal_percent_path = try std.fs.path.join(
+        alloc,
+        &.{ root, "literal%20name.zig" },
+    );
+    const missing = try std.fs.path.join(alloc, &.{ root, "missing.zig" });
+    const located = try std.fmt.allocPrint(alloc, "{s}:42:9", .{source});
+
+    const argv = (try linkFileCommandArgs(alloc, command, located, .plain, null)).?;
+    try testing.expectEqual(4, argv.len);
+    try testing.expectEqualStrings(command, argv[0]);
+    try testing.expectEqualStrings(source, argv[1]);
+    try testing.expectEqualStrings("42", argv[2]);
+    try testing.expectEqualStrings("9", argv[3]);
+
+    const defaults = (try linkFileCommandArgs(alloc, command, source, .plain, null)).?;
+    try testing.expectEqualStrings("1", defaults[2]);
+    try testing.expectEqualStrings("1", defaults[3]);
+
+    const encoded_percent = try std.mem.replaceOwned(
+        u8,
+        alloc,
+        source_with_escapes,
+        "%",
+        "%25",
+    );
+    const encoded_spaces = try std.mem.replaceOwned(
+        u8,
+        alloc,
+        encoded_percent,
+        " ",
+        "%20",
+    );
+    const encoded_located = try std.fmt.allocPrint(alloc, "{s}:42:9", .{encoded_spaces});
+    const encoded_argv = (try linkFileCommandArgs(
+        alloc,
+        command,
+        encoded_located,
+        .percent_encoded,
+        root,
+    )).?;
+    try testing.expectEqualStrings(source_with_escapes, encoded_argv[1]);
+    try testing.expectEqualStrings("42", encoded_argv[2]);
+    try testing.expectEqualStrings("9", encoded_argv[3]);
+
+    const encoded_colons = try std.mem.replaceOwned(u8, alloc, source, ":", "%3A");
+    const encoded_colons_and_spaces = try std.mem.replaceOwned(
+        u8,
+        alloc,
+        encoded_colons,
+        " ",
+        "%20",
+    );
+    const encoded_colon_location = try std.fmt.allocPrint(
+        alloc,
+        "{s}:42:9",
+        .{encoded_colons_and_spaces},
+    );
+    const encoded_colon_argv = (try linkFileCommandArgs(
+        alloc,
+        command,
+        encoded_colon_location,
+        .percent_encoded,
+        null,
+    )).?;
+    try testing.expectEqualStrings(source, encoded_colon_argv[1]);
+
+    const literal_percent = (try linkFileCommandArgs(
+        alloc,
+        command,
+        literal_percent_path,
+        .plain,
+        null,
+    )).?;
+    try testing.expectEqualStrings(literal_percent_path, literal_percent[1]);
+
+    const relative_encoded = "source%20with%20space%25sign.zig:42:9";
+    const relative_argv = (try linkFileCommandArgs(
+        alloc,
+        command,
+        relative_encoded,
+        .percent_encoded,
+        root,
+    )).?;
+    try testing.expectEqualStrings(source_with_escapes, relative_argv[1]);
+    try testing.expectEqualStrings("42", relative_argv[2]);
+    try testing.expectEqualStrings("9", relative_argv[3]);
+
+    const encoded_missing = try std.mem.replaceOwned(u8, alloc, missing, " ", "%20");
+    try testing.expect(try linkFileCommandArgs(
+        alloc,
+        command,
+        encoded_missing,
+        .percent_encoded,
+        null,
+    ) == null);
+    try testing.expect(try linkFileCommandArgs(
+        alloc,
+        command,
+        "relative%20file.zig:42:9",
+        .percent_encoded,
+        null,
+    ) == null);
+    try testing.expect(try linkFileCommandArgs(
+        alloc,
+        command,
+        "missing%20relative.zig:42:9",
+        .percent_encoded,
+        root,
+    ) == null);
+    try testing.expect(try linkFileCommandArgs(
+        alloc,
+        command,
+        relative_encoded,
+        .percent_encoded,
+        "relative-pwd",
+    ) == null);
+    try testing.expect(try linkFileCommandArgs(
+        alloc,
+        command,
+        "https://example.com/file.zig:42:9",
+        .percent_encoded,
+        root,
+    ) == null);
+    try testing.expect(try linkFileCommandArgs(
+        alloc,
+        command,
+        "/missing%ZZfile.zig:42:9",
+        .percent_encoded,
+        null,
+    ) == null);
+    try testing.expect(try linkFileCommandArgs(alloc, command, "relative.zig", .plain, null) == null);
+    try testing.expect(try linkFileCommandArgs(alloc, command, missing, .plain, null) == null);
+    try testing.expect(try linkFileCommandArgs(alloc, command, root, .plain, null) == null);
+    try testing.expect(try linkFileCommandArgs(
+        alloc,
+        not_executable,
+        source,
+        .plain,
+        null,
+    ) == null);
 }
 
 /// Returns the x/y coordinate of where the IME (Input Method Editor)
@@ -4506,6 +4786,12 @@ fn processLinks(self: *Surface, pos: apprt.CursorPos) !bool {
             });
             defer self.alloc.free(str);
 
+            if (self.openFileWithCommand(str, .plain)) |handled| {
+                if (handled) return true;
+            } else |err| {
+                log.warn("error running link-file-command err={}", .{err});
+            }
+
             const resolved_path = try self.resolvePathForOpening(str);
             defer if (resolved_path) |p| self.alloc.free(p);
 
@@ -4518,6 +4804,15 @@ fn processLinks(self: *Surface, pos: apprt.CursorPos) !bool {
                 log.warn("failed to get URI for OSC8 hyperlink", .{});
                 return false;
             };
+
+            // why: OpenCode emits file locations as raw OSC 8 targets,
+            // so route them through the same validated opener as text matches.
+            if (self.openFileWithCommand(uri, .percent_encoded)) |handled| {
+                if (handled) return true;
+            } else |err| {
+                log.warn("error running link-file-command err={}", .{err});
+            }
+
             try self.openUrl(.{ .kind = .unknown, .url = uri });
         },
     }

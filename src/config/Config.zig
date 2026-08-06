@@ -1432,6 +1432,14 @@ link: RepeatableLink = .{},
 /// Available since: 1.2.0
 @"link-previews": LinkPreviews = .true,
 
+/// Absolute executable to invoke for an existing file-path link. Relative OSC
+/// 8 targets resolve against the terminal's working directory. The executable
+/// receives the resolved absolute file, line, and column as separate arguments.
+/// Line and column default to `1`. The executable is invoked directly without
+/// a shell. If this is unset or the target cannot resolve to an existing file,
+/// Ghostty uses its normal opener.
+@"link-file-command": ?[:0]const u8 = null,
+
 /// Whether to start the window in a maximized state. This setting applies
 /// to new windows and does not apply to tabs, splits, etc. However, this setting
 /// will apply to all new windows, not just the first one.
@@ -3940,6 +3948,28 @@ test "handle bom in config files" {
             cfg.@"abnormal-command-exit-runtime",
         );
     }
+}
+
+test "link file command config" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const data = "link-file-command = /tmp/ghostty-plus-nvim\n";
+    var reader: std.Io.Reader = .fixed(data);
+    var config = try Config.default(alloc);
+    defer config.deinit();
+
+    try config.loadReader(
+        alloc,
+        &reader,
+        "/home/ghostty/.config/ghostty/config.ghostty",
+    );
+    try config.finalize();
+
+    try testing.expect(config._diagnostics.empty());
+    try testing.expectEqualStrings(
+        "/tmp/ghostty-plus-nvim",
+        config.@"link-file-command".?,
+    );
 }
 
 pub const OptionalFileAction = enum { loaded, not_found, @"error" };

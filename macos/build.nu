@@ -26,6 +26,7 @@ def main [
         -project $project
         -scheme $scheme
         -configuration $configuration
+        -packageAuthorizationProvider netrc
         $"SYMROOT=($build_dir)"
         ...$skip_testing
         $action)

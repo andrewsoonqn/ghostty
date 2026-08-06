@@ -51,6 +51,35 @@ pub const Highlight = union(enum) {
     hover_mods: Mods,
 };
 
+pub const FilePath = struct {
+    path: []const u8,
+    line: ?[]const u8 = null,
+    column: ?[]const u8 = null,
+};
+
+/// Split up to two trailing numeric `:line[:column]` segments from a path.
+pub fn parseFilePath(value: []const u8) FilePath {
+    var result: FilePath = .{ .path = value };
+
+    for (0..2) |_| {
+        const separator = std.mem.lastIndexOfScalar(u8, result.path, ':') orelse break;
+        const segment = result.path[separator + 1 ..];
+        if (!allDigits(segment)) break;
+
+        result.column = result.line;
+        result.line = segment;
+        result.path = result.path[0..separator];
+    }
+
+    return result;
+}
+
+fn allDigits(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |char| if (!std.ascii.isDigit(char)) return false;
+    return true;
+}
+
 /// Returns a new oni.Regex that can be used to match the link.
 pub fn oniRegex(self: *const Link) !oni.Regex {
     return try oni.Regex.init(
@@ -76,4 +105,45 @@ pub fn equal(self: *const Link, other: *const Link) bool {
     return std.meta.eql(self.action, other.action) and
         std.meta.eql(self.highlight, other.highlight) and
         std.mem.eql(u8, self.regex, other.regex);
+}
+
+test "parse file path location" {
+    const testing = std.testing;
+
+    {
+        const parsed = parseFilePath("/tmp/main.zig");
+        try testing.expectEqualStrings("/tmp/main.zig", parsed.path);
+        try testing.expect(parsed.line == null);
+        try testing.expect(parsed.column == null);
+    }
+    {
+        const parsed = parseFilePath("/tmp/main.zig:42");
+        try testing.expectEqualStrings("/tmp/main.zig", parsed.path);
+        try testing.expectEqualStrings("42", parsed.line.?);
+        try testing.expect(parsed.column == null);
+    }
+    {
+        const parsed = parseFilePath("/tmp/main.zig:42:10");
+        try testing.expectEqualStrings("/tmp/main.zig", parsed.path);
+        try testing.expectEqualStrings("42", parsed.line.?);
+        try testing.expectEqualStrings("10", parsed.column.?);
+    }
+    {
+        const parsed = parseFilePath("/tmp/name:with:colon:42:10");
+        try testing.expectEqualStrings("/tmp/name:with:colon", parsed.path);
+        try testing.expectEqualStrings("42", parsed.line.?);
+        try testing.expectEqualStrings("10", parsed.column.?);
+    }
+    {
+        const parsed = parseFilePath("/tmp/main.zig:line");
+        try testing.expectEqualStrings("/tmp/main.zig:line", parsed.path);
+        try testing.expect(parsed.line == null);
+        try testing.expect(parsed.column == null);
+    }
+    {
+        const parsed = parseFilePath("/tmp/main.zig:42:column");
+        try testing.expectEqualStrings("/tmp/main.zig:42:column", parsed.path);
+        try testing.expect(parsed.line == null);
+        try testing.expect(parsed.column == null);
+    }
 }

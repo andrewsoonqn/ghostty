@@ -1,0 +1,25 @@
+#!/bin/zsh
+
+set -euo pipefail
+
+if (( $# != 3 )); then
+    print -u2 "usage: ghostty-plus-nvim FILE LINE COLUMN"
+    exit 64
+fi
+
+file=$1
+line=$2
+column=$3
+
+if [[ ! -f $file ]]; then
+    print -u2 "ghostty-plus-nvim: file does not exist: $file"
+    exit 66
+fi
+
+if [[ $line != <-> || $column != <-> ]]; then
+    print -u2 "ghostty-plus-nvim: line and column must be numeric"
+    exit 65
+fi
+
+exec /usr/bin/open -na "/Applications/Ghostty+.app" --args \
+    -e /opt/homebrew/bin/nvim -c "call cursor(${line}, ${column})" -- "$file"
