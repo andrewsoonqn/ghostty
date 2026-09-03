@@ -1,3 +1,8 @@
+> [!IMPORTANT]
+> **This personal fork is retired.** The Ghostty+ custom file-link workflow
+> has been superseded by Pi Opener's Herdr integration. Use
+> [upstream Ghostty](https://github.com/ghostty-org/ghostty) instead.
+
 <!-- LOGO -->
 <h1>
 <p align="center">
